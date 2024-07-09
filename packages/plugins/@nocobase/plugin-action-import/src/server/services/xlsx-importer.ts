@@ -52,14 +52,11 @@ export class XlsxImporter extends EventEmitter {
 
     try {
       const imported = await this.performImport(options);
-
       // @ts-ignore
       if (this.options.collectionManager.db) {
         await this.resetSeq(options);
       }
-
       transaction && (await transaction.commit());
-
       return imported;
     } catch (error) {
       transaction && (await transaction.rollback());
@@ -124,7 +121,7 @@ export class XlsxImporter extends EventEmitter {
   async performImport(options?: RunOptions) {
     const transaction = options?.transaction;
     const rows = this.getData();
-    const chunks = lodash.chunk(rows, this.options.chunkSize || 200);
+    const chunks = lodash.chunk(rows, this.options.chunkSize || 5000);
 
     let handingRowIndex = 1;
 
@@ -133,70 +130,74 @@ export class XlsxImporter extends EventEmitter {
     }
 
     let imported = 0;
+    await Promise.all(
+      chunks.map(async (chunkRows) => {
+        for (const row of chunkRows) {
+          const rowValues = {};
+          handingRowIndex += 1;
+          try {
+            for (let index = 0; index < this.options.columns.length; index++) {
+              const column = this.options.columns[index];
 
-    for (const chunkRows of chunks) {
-      for (const row of chunkRows) {
-        const rowValues = {};
-        handingRowIndex += 1;
-        try {
-          for (let index = 0; index < this.options.columns.length; index++) {
-            const column = this.options.columns[index];
+              const dataKey = column.dataIndex[0];
 
-            const field = this.options.collection.getField(column.dataIndex[0]);
+              const field = this.options.collection.getField(dataKey);
 
-            if (!field) {
-              throw new Error(`Field not found: ${column.dataIndex[0]}`);
+              if (!field) {
+                throw new Error(`Field not found: ${dataKey}`);
+              }
+
+              const str = row[index];
+
+              const fieldOptions = field.options;
+
+              const interfaceName = fieldOptions.interface;
+
+              const InterfaceClass = this.options.collectionManager.getFieldInterface(interfaceName);
+
+              if (!InterfaceClass) {
+                rowValues[dataKey] = str;
+                continue;
+              }
+
+              const interfaceInstance = new InterfaceClass(field.options);
+
+              const ctx: any = {
+                transaction,
+                field,
+              };
+
+              if (column.dataIndex.length > 1) {
+                ctx.targetCollection = (field as IRelationField).targetCollection();
+                ctx.filterKey = column.dataIndex[1];
+              }
+
+              rowValues[dataKey] = await interfaceInstance.toValue(this.trimString(str), ctx);
             }
 
-            const str = row[index];
-
-            const dataKey = column.dataIndex[0];
-
-            const fieldOptions = field.options;
-
-            const interfaceName = fieldOptions.interface;
-
-            const InterfaceClass = this.options.collectionManager.getFieldInterface(interfaceName);
-
-            if (!InterfaceClass) {
-              rowValues[dataKey] = str;
-              continue;
-            }
-
-            const interfaceInstance = new InterfaceClass(field.options);
-
-            const ctx: any = {
+            await this.options.collection.repository.create({
+              values: rowValues,
               transaction,
-              field,
-            };
+            });
 
-            if (column.dataIndex.length > 1) {
-              ctx.targetCollection = (field as IRelationField).targetCollection();
-              ctx.filterKey = column.dataIndex[1];
-            }
-
-            rowValues[dataKey] = await interfaceInstance.toValue(this.trimString(str), ctx);
+            imported += 1;
+            await new Promise((resolve) => setTimeout(resolve, 0));
+          } catch (error) {
+            throw new Error(
+              `failed to import row ${handingRowIndex}, message: ${error.message}, rowData: ${JSON.stringify(
+                rowValues,
+              )}`,
+              { cause: error },
+            );
           }
-
-          await this.options.collection.repository.create({
-            values: rowValues,
-            transaction,
-          });
-
-          imported += 1;
-
-          await new Promise((resolve) => setTimeout(resolve, 5));
-        } catch (error) {
-          throw new Error(
-            `failed to import row ${handingRowIndex}, message: ${error.message}, rowData: ${JSON.stringify(rowValues)}`,
-            { cause: error },
-          );
         }
-      }
+      }),
+    );
+    // for (const chunkRows of chunks) {
 
-      // await to prevent high cpu usage
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
+    //   // await to prevent high cpu usage
+    //   await new Promise((resolve) => setTimeout(resolve, 1));
+    // }
 
     return imported;
   }
